@@ -1,199 +1,375 @@
-# Final Architecture — Legal Document Extraction System
+# workflow.md
+document_type: WILL (generalises to all doc types)
+pattern: bounded ReAct · map-reduce · orchestrator-worker
 
 ---
 
-## Design Principles
-
-- Context engineering over hardcoded logic
-- Harness owns execution. Agent owns reasoning.
-- Progressive disclosure — context grows as understanding grows
-- Citations are ground truth — no field without evidence
-- Quality over flexibility — fine-grained plan is intentional
-
----
-
-## Patterns
-
-| Layer | Pattern |
-|-------|---------|
-| Orchestrator | Bounded ReAct |
-| Computation | Map-Reduce |
-| Agent structure | Orchestrator-Worker |
-| Retrieval | RAG (article cache) |
-| Context | Progressive Disclosure |
-| Verification | Citation grounding |
-| Intent | Set theory routing |
-
----
-
-## File Structure
+## Overview
 
 ```
-agent.md                    doc-type agnostic   orchestrator behavior
-plan_will.md                per doc type        fine-grained fact list
-workers_will.yaml           per doc type        intent worker definitions
-skills/will/B1.md           per intent          people inference
-skills/will/B2.md           per intent          asset inference
-skills/will/B3.md           per intent          clause inference
-skills/will/B4.md           per intent          attestation inference
-knowledge_will.md           per doc type        legal terminology
-```
-
-### Extensibility contract
-```
-New schema field    →  update skill.md + knowledge.md only
-New intent subset   →  new worker in workers.yaml + new section in plan.md
-New document type   →  new plan.md + workers.yaml + skills/
-Framework change    →  agent.md only
+document + doc type
+        ↓
+  load context          harness
+        ↓
+  classify + route      main agent  (map phase)
+        ↓
+  dispatch workers      harness
+        ↓
+  workers extract       workers     (parallel)
+        ↓
+  collect results       harness
+        ↓
+  reduce + derive       main agent  (reduce phase)
+        ↓
+  self-correction       main agent + harness
+        ↓
+  validate structure    harness
+        ↓
+  schema output
 ```
 
 ---
 
-## Harness State
+## Inputs
 
+| input | source | description |
+|-------|--------|-------------|
+| document_id | caller | OpenSearch document identifier |
+| document_type | caller | WILL / TRUST / POA etc. |
+| request | caller | natural language query |
+
+---
+
+## Phase 1 — Map
+
+### Step 1 — Load context
+
+**Owner:** harness (loader.py)
+
+**Loads:**
 ```
-document_state      id, doc_type, phase (map | reduce | complete)
-article_cache       segment_id → OCR content (fetched once, reused)
-worker_state        fact_id → { status, attempt_count, result }
-fact_pool           all raw worker outputs with citations
-schema_state        field → { value, status, citation }
-correction_state    fact_id → attempt_count
+agent.md               →  orchestrator behaviour
+plan_will.md           →  fact list for this doc type
+workers_will.yaml      →  intent worker definitions
+knowledge_will.md      →  legal terminology
 ```
 
----
+**Context injected into main agent (XML-wrapped):**
+```xml
+<agent_behavior>   [agent.md content]     </agent_behavior>
+<extraction_plan>  [plan.md content]      </extraction_plan>
+<workers>          [workers.yaml content] </workers>
+<knowledge>        [knowledge.md content] </knowledge>
+<document_index>   [article summaries from OpenSearch] </document_index>
+<request>          [incoming request]     </request>
+```
 
-## Memory — Context Per LLM Call
-
-| Call | Context injected |
-|------|-----------------|
-| Map | agent.md + plan.md + workers.yaml + knowledge.md + document_index |
-| Worker | worker_task + skill.md + assigned articles (from cache) |
-| Reduce | agent.md + knowledge.md + skill.md + schema definition + full raw fact pool |
-| Correction | agent.md + knowledge.md + skill.md + previous schema + problem facts only |
-
----
-
-## Execution Workflow
-
-### Phase 1 — Map
-
-**1. Load context**
-Harness loads: agent.md + plan.md + workers.yaml + knowledge.md
-
-**2. Classify intent**
-Main agent reads request + doc type.
-Matches against intent sets in plan.md (A–F).
-Identifies subset (B1, B2...) and intersections.
-Applies dependencies: B requires A, D requires A×A, F requires C.
-
-**3. Route**
-Main agent reads document_index summaries.
-Matches each fact against article summaries.
-Assigns minimum necessary articles per fact.
-
-**4. Map facts to workers**
-Main agent reads workers.yaml descriptions.
-Infers which worker handles which fact cluster.
-Signals harness: { fact_id, worker_id, articles }
-
-**5. Assemble worker contexts**
-Harness loads skill.md for each worker.
-Fetches articles from OpenSearch → caches by segment_id.
-Assembles: worker_task + skill + cached articles.
-
-**6. Dispatch workers (parallel)**
-All workers fire simultaneously.
-Same agent, different context.
-Each worker returns: { fact_id, value, citation, status }
-
-**7. Collect + update state**
-Harness collects all results into fact_pool.
-Updates worker_state per fact.
-Waits for all workers before signalling reduce.
+**State updated:** context loaded
 
 ---
 
-### Phase 2 — Reduce
+### Step 2 — Classify intent
 
-**8. Reduce**
-Main agent receives full raw fact pool.
-Loads intent skill (e.g. skills/will/B1.md).
-Applies skill inference to all facts.
-Derives complex fields across facts:
-- first_death / second_death from survivorship evidence
-- successor chains from executor + successor facts
+**Owner:** main agent
 
-**9. Self-correction**
-For each field review:
-- found + citation present → proceed
-- absent + null citation → mark null with reason
-- uncertain + null citation → signal harness: re-route
+**Input:** XML context from step 1
 
-Correction call context: previous schema + problem facts only.
-Max attempts reached → status: requires_review.
+**Task:**
+- Match request against intent sets A–F in plan.md
+- Identify intent subset: B1, B2, B3...
+- Identify intersections: A2∩B1 → sequence by dependency
+- Apply dependencies:
+  - B requires A first
+  - D requires A × A (two documents)
+  - F requires C first
 
-**10. Validate**
-Harness validates schema structure only:
-- all fields have a status
-- JSON well-formed
-- status values are valid enum
-
-**11. Output**
-Every field carries:
+**Output:**
 ```json
 {
-  "value": "...",
-  "status": "found | absent | uncertain | unverified | requires_review",
+  "intent_set": "B",
+  "intent_subset": "B1",
+  "intersection": null
+}
+```
+
+---
+
+### Step 3 — Route facts to articles
+
+**Owner:** main agent
+
+**Input:** classified intent + document_index summaries in context
+
+**Task:**
+- For each fact in plan.md[B1]:
+  match fact description against article summaries
+  assign minimum necessary articles
+- Do not over-assign — lean routing improves extraction quality
+- Same article can be assigned to multiple facts (overlap expected)
+
+**Output:**
+```json
+{
+  "testator":   { "worker_id": "people_worker", "articles": ["article_1"] },
+  "executor":   { "worker_id": "people_worker", "articles": ["article_5"] },
+  "first_death":{ "worker_id": "people_worker", "articles": ["article_5", "article_9"] }
+}
+```
+
+---
+
+### Step 4 — Assemble worker contexts
+
+**Owner:** harness (dispatcher.py)
+
+**Task:**
+- Deduplicate article assignments → fetch each article ONCE from OpenSearch
+- Cache all articles in memory: `{ segment_id → OCR text }`
+- For each fact, load the bound skill from workers.yaml
+- Assemble one context per worker task
+
+**Worker context (XML-wrapped):**
+```xml
+<worker_task>
+  fact_id: executor
+  question: Who is appointed as executor and under what conditions?
+</worker_task>
+<skill>   [skills/will/B1.md content]    </skill>
+<articles>
+  <article segment_id="article_5">
+    [OCR text]
+  </article>
+</articles>
+```
+
+**State updated:** article_cache populated
+
+---
+
+### Step 5 — Dispatch workers (parallel)
+
+**Owner:** harness (dispatcher.py) + workers
+
+**Task:**
+- Fire all worker LLM calls simultaneously (asyncio.gather)
+- Same agent class, different context per worker
+- Each worker reads articles + skill → extracts one fact + citation
+
+**Worker output (per fact):**
+```json
+{
+  "fact_id":  "executor",
+  "value":    "Jane Smith",
+  "status":   "found",
   "citation": {
-    "segment_id": "article_N",
-    "text": "exact passage from worker"
+    "segment_id": "article_5",
+    "text": "I appoint Jane Smith as executor of my estate..."
+  }
+}
+```
+
+**Status values:**
+| status | meaning |
+|--------|---------|
+| found | fact extracted with citation |
+| absent | searched all assigned articles, not found |
+| uncertain | could not determine from available articles |
+
+---
+
+### Step 6 — Collect results
+
+**Owner:** harness (collector.py)
+
+**Task:**
+- Wait for ALL workers to complete (no partial reduce)
+- Accumulate all worker outputs into fact_pool
+- Update worker_state per fact_id
+
+**State updated:** fact_pool, worker_state, phase → REDUCE
+
+---
+
+## Phase 2 — Reduce
+
+### Step 7 — Build reduce context
+
+**Owner:** harness (reducer.py)
+
+**Reduce context (XML-wrapped):**
+```xml
+<agent_behavior>   [agent.md content]               </agent_behavior>
+<knowledge>        [knowledge.md content]            </knowledge>
+<skill>            [skills/will/B1.md content]       </skill>
+<schema_definition>[schema fields for this doc type] </schema_definition>
+<fact_pool>        [all raw worker outputs]           </fact_pool>
+```
+
+**Note:** fact_pool is sent raw and uncompressed — no information loss.
+
+---
+
+### Step 8 — Apply skills + derive fields
+
+**Owner:** main agent
+
+**Task:**
+- Read all facts from fact_pool
+- Apply skill inference per fact
+- Derive complex fields that require inference across multiple facts:
+  - `first_death` / `second_death` → from survivorship evidence
+  - `successor_chain` → from executor + successor_executor facts
+  - `contingent_entitlement` → from survivorship + beneficiary facts
+- Ground all inference in knowledge terms
+
+**Per-fact status handling:**
+| status | action |
+|--------|--------|
+| found + citation | apply skill, populate schema field |
+| absent + null | mark field null with reason |
+| uncertain + null | flag for correction loop |
+
+**Output:** schema with status + citation per field
+
+---
+
+### Step 9 — Self-correction loop
+
+**Owner:** main agent + harness
+
+**Trigger:** any field with status `uncertain` or `unverified`
+
+**Loop:**
+```
+while uncertain fields exist:
+  if all uncertain fields at max attempts:
+    mark all as requires_review
+    break
+
+  harness: re-route uncertain facts to broader article set
+  worker: re-run for uncertain facts only
+  
+  correction context:
+    previous schema + new worker results (problem facts only)
+    NOT full fact_pool — compressed, targeted
+
+  main agent: re-reduce problem fields
+  update schema
+```
+
+**Correction context (XML-wrapped):**
+```xml
+<agent_behavior>    [agent.md]                </agent_behavior>
+<knowledge>         [knowledge.md]            </knowledge>
+<skill>             [skill.md]                </skill>
+<previous_schema>   [schema built so far]     </previous_schema>
+<correction_facts>  [new results for uncertain facts only] </correction_facts>
+```
+
+**Correction limits:**
+```
+MAX_CORRECTION_ATTEMPTS = 2
+exceeded → status: requires_review → human review
+```
+
+---
+
+## Validation
+
+### Step 10 — Validate schema structure
+
+**Owner:** harness (validator.py)
+
+**Checks (structural only — no content validation):**
+- All fields have a status value
+- Status values are valid enum members
+- JSON structure is well-formed
+- Required fields are present
+
+**Not validated by harness:**
+- Content accuracy
+- Citation correctness
+- Logical consistency
+
+**Output:** SchemaOutput or validation error
+
+---
+
+## Output
+
+Every field in the final schema carries:
+
+```json
+{
+  "testator": {
+    "value":  "John Smith",
+    "status": "found",
+    "citation": {
+      "segment_id": "article_1",
+      "text": "I, John Smith, being of sound and disposing mind..."
+    }
+  },
+  "first_death": {
+    "value":  null,
+    "status": "absent",
+    "reason": "no survivorship clause present in assigned articles",
+    "citation": null
+  },
+  "no_contest_clause": {
+    "value":  null,
+    "status": "requires_review",
+    "reason": "max correction attempts reached",
+    "citation": null
   }
 }
 ```
 
 ---
 
-## Self-Correction
+## State transitions
 
-| Trigger | Action |
-|---------|--------|
-| status: uncertain | re-route to broader article set |
-| citation unverifiable | status: unverified, do not populate |
-| skill cannot resolve | status: requires_review |
-| max attempts reached | status: requires_review → human review |
-| required field absent | status: requires_review |
-
-**Correction call is compressed:**
-Only problem fields + their raw worker outputs.
-Not full fact pool. Previous schema included for context.
+```
+INIT  →  MAP        on: context loaded
+MAP   →  REDUCE     on: all workers complete
+REDUCE → CORRECTION on: uncertain fields detected
+CORRECTION → REDUCE on: correction workers complete
+REDUCE → COMPLETE   on: all fields resolved or max attempts reached
+```
 
 ---
 
-## Article Overlap Strategy
+## Error reference
 
-High overlap articles (B1∩B2, B1∩B2∩B3):
-- Router assigns same article to multiple workers
-- Harness deduplicates → fetches each article once
-- All workers read from cache
-- Different workers cite different passages from same article
+| condition | detected by | action |
+|-----------|-------------|--------|
+| worker: uncertain | collector | flag in fact_pool |
+| worker: unverified citation | main agent | flag in schema |
+| max correction attempts | harness | status: requires_review |
+| schema structure invalid | validator | raise validation error |
+| intersection query A∩B | main agent | run A first, pipe into B |
+| article not found | opensearch client | log, skip segment |
 
 ---
 
-## Skill Segmentation
+## Article overlap strategy
 
-Intent-driven, per document type:
+B1∩B2 and B1∩B2∩B3 overlaps are expected in WILL documents (bequests, residuary, trust provisions). Strategy:
 
 ```
-skills/will/B1.md    people inference (WILL)
-skills/will/B2.md    asset inference (WILL)
-skills/will/B3.md    clause inference (WILL)
-skills/will/B4.md    attestation inference (WILL)
-
-skills/trust/B1.md   people inference (TRUST)
-...
+router assigns same article to multiple workers
+harness deduplicates before fetching
+article fetched ONCE → cached
+multiple workers read from cache
+different workers cite different passages from same article
 ```
 
-One skill per intent per doc type.
-Used by both workers (extraction) and main agent (derivation).
-Knowledge embedded inside skill for workers.
-Knowledge.md loaded separately for main agent.
+---
+
+## Extensibility
+
+| change | files to update |
+|--------|----------------|
+| new schema field | skill.md + knowledge.md |
+| new intent subset | workers.yaml + plan.md |
+| new document type | plan_{type}.md + workers_{type}.yaml + skills/{type}/ |
+| framework behaviour | agent.md only |
