@@ -1,375 +1,309 @@
-# workflow.md
-document_type: WILL (generalises to all doc types)
-pattern: bounded ReAct · map-reduce · orchestrator-worker
+# Family Tree SVG Generator — Requirements: In-Laws & Ex-Partners Support
+
+> **Mission:** Extend the existing SVG family tree generator to render in-laws and ex-partners
+> as first-class nodes, with distinct visual treatment and relationship edges, without
+> disrupting the existing subtree distribution algorithm or the 1:1 aspect ratio constraint.
 
 ---
 
-## Overview
+## 1. Background & Constraints
 
-```
-document + doc type
-        ↓
-  load context          harness
-        ↓
-  classify + route      main agent  (map phase)
-        ↓
-  dispatch workers      harness
-        ↓
-  workers extract       workers     (parallel)
-        ↓
-  collect results       harness
-        ↓
-  reduce + derive       main agent  (reduce phase)
-        ↓
-  self-correction       main agent + harness
-        ↓
-  validate structure    harness
-        ↓
-  schema output
-```
+The existing system:
+- Generates a hierarchical SVG family tree
+- Uses a **subtree distribution algorithm** that splits large trees into smaller subtrees to maintain a **1:1 aspect ratio**
+- Nodes are currently assumed to be **blood relatives only**, laid out top-down by generation
+- Edges currently represent only **parent → child** relationships
+
+What must not break:
+- The subtree distribution logic and its width/height balancing
+- The 1:1 aspect ratio enforcement
+- Existing node positioning within blood-relative generations
+- SVG output format and any existing consumer of it
 
 ---
 
-## Inputs
+## 2. New Concepts & Definitions
 
-| input | source | description |
-|-------|--------|-------------|
-| document_id | caller | OpenSearch document identifier |
-| document_type | caller | WILL / TRUST / POA etc. |
-| request | caller | natural language query |
-
----
-
-## Phase 1 — Map
-
-### Step 1 — Load context
-
-**Owner:** harness (loader.py)
-
-**Loads:**
-```
-agent.md               →  orchestrator behaviour
-plan_will.md           →  fact list for this doc type
-workers_will.yaml      →  intent worker definitions
-knowledge_will.md      →  legal terminology
-```
-
-**Context injected into main agent (XML-wrapped):**
-```xml
-<agent_behavior>   [agent.md content]     </agent_behavior>
-<extraction_plan>  [plan.md content]      </extraction_plan>
-<workers>          [workers.yaml content] </workers>
-<knowledge>        [knowledge.md content] </knowledge>
-<document_index>   [article summaries from OpenSearch] </document_index>
-<request>          [incoming request]     </request>
-```
-
-**State updated:** context loaded
+| Term | Definition |
+|---|---|
+| **Blood node** | An existing node — a direct biological/adoptive family member |
+| **In-law node** | A person who joins the family through marriage/partnership to a blood node |
+| **Ex-node** | A former partner (divorced or separated) of a blood node or in-law node |
+| **Partner edge** | A horizontal edge connecting two people in a couple (current or former) |
+| **Parent edge** | The existing vertical edge from parent(s) to child (unchanged) |
+| **Anchor node** | The blood node to whom an in-law or ex-node is attached |
 
 ---
 
-### Step 2 — Classify intent
+## 3. Data Model Changes
 
-**Owner:** main agent
+### 3.1 Person Node — Add New Fields
 
-**Input:** XML context from step 1
+Extend the existing person/node object with the following fields:
 
-**Task:**
-- Match request against intent sets A–F in plan.md
-- Identify intent subset: B1, B2, B3...
-- Identify intersections: A2∩B1 → sequence by dependency
-- Apply dependencies:
-  - B requires A first
-  - D requires A × A (two documents)
-  - F requires C first
-
-**Output:**
 ```json
 {
-  "intent_set": "B",
-  "intent_subset": "B1",
-  "intersection": null
+  "id": "string",
+  "name": "string",
+  "birthYear": "number | null",
+  "deathYear": "number | null",
+
+  // --- EXISTING ---
+  "parentIds": ["string"],
+
+  // --- NEW ---
+  "nodeType": "blood | inlaw | ex",
+  "partnerId": "string | null",
+  "partnerRelationship": "married | partnered | divorced | separated | widowed",
+  "anchorId": "string | null"
 }
 ```
 
----
+**Field rules:**
+- `nodeType` defaults to `"blood"` for all existing nodes — no migration needed
+- `anchorId` must be set for every `inlaw` and `ex` node; it points to the blood node they attach to
+- `partnerId` is bidirectional — if A's `partnerId` is B, then B's `partnerId` must be A
+- An `ex` node may have `parentIds` populated if they are a biological parent of children in the tree
+- An `inlaw` node may itself have `nodeType: "inlaw"` children (e.g. in-law's children from a prior relationship) — treat these as `ex` nodes relative to the main tree
 
-### Step 3 — Route facts to articles
+### 3.2 Multiple Partners (Remarriage / Serial Relationships)
 
-**Owner:** main agent
+A blood node may have more than one partner across time. To support this:
 
-**Input:** classified intent + document_index summaries in context
-
-**Task:**
-- For each fact in plan.md[B1]:
-  match fact description against article summaries
-  assign minimum necessary articles
-- Do not over-assign — lean routing improves extraction quality
-- Same article can be assigned to multiple facts (overlap expected)
-
-**Output:**
 ```json
 {
-  "testator":   { "worker_id": "people_worker", "articles": ["article_1"] },
-  "executor":   { "worker_id": "people_worker", "articles": ["article_5"] },
-  "first_death":{ "worker_id": "people_worker", "articles": ["article_5", "article_9"] }
+  "id": "person_A",
+  "nodeType": "blood",
+  "partners": [
+    { "partnerId": "person_B", "partnerRelationship": "divorced", "order": 1 },
+    { "partnerId": "person_C", "partnerRelationship": "married",  "order": 2 }
+  ]
 }
 ```
 
----
-
-### Step 4 — Assemble worker contexts
-
-**Owner:** harness (dispatcher.py)
-
-**Task:**
-- Deduplicate article assignments → fetch each article ONCE from OpenSearch
-- Cache all articles in memory: `{ segment_id → OCR text }`
-- For each fact, load the bound skill from workers.yaml
-- Assemble one context per worker task
-
-**Worker context (XML-wrapped):**
-```xml
-<worker_task>
-  fact_id: executor
-  question: Who is appointed as executor and under what conditions?
-</worker_task>
-<skill>   [skills/will/B1.md content]    </skill>
-<articles>
-  <article segment_id="article_5">
-    [OCR text]
-  </article>
-</articles>
-```
-
-**State updated:** article_cache populated
+- `order` determines left-to-right rendering sequence of partners on the same generation row
+- Current/active partner (`married`, `partnered`, `widowed`) renders **closest** to the anchor node
+- Ex-partners render **further out** from the anchor node, in reverse chronological order
 
 ---
 
-### Step 5 — Dispatch workers (parallel)
+## 4. Layout Algorithm Changes
 
-**Owner:** harness (dispatcher.py) + workers
+> **Core principle:** In-law and ex-nodes are **satellites** of their anchor node.
+> They must never be treated as independent tree roots or be factored into the
+> subtree distribution algorithm as width-generating nodes.
 
-**Task:**
-- Fire all worker LLM calls simultaneously (asyncio.gather)
-- Same agent class, different context per worker
-- Each worker reads articles + skill → extracts one fact + citation
+### 4.1 Generation Row Assignment
 
-**Worker output (per fact):**
-```json
-{
-  "fact_id":  "executor",
-  "value":    "Jane Smith",
-  "status":   "found",
-  "citation": {
-    "segment_id": "article_5",
-    "text": "I appoint Jane Smith as executor of my estate..."
-  }
-}
+- In-law and ex-nodes inherit the **same generation row** as their anchor node
+- They are placed **horizontally adjacent** to their anchor node on that row
+- They do not occupy a slot in the generation's primary node sequence — they are offset laterally
+
+### 4.2 Width Budget Rule
+
+When the subtree distribution algorithm calculates the width of a subtree:
+
+```
+subtreeWidth = f(bloodNodes only)
 ```
 
-**Status values:**
-| status | meaning |
-|--------|---------|
-| found | fact extracted with citation |
-| absent | searched all assigned articles, not found |
-| uncertain | could not determine from available articles |
+In-law and ex-nodes are **excluded from width budget calculations**. After blood node positions are resolved, satellite nodes are placed adjacent to their anchor using a fixed lateral offset:
+
+```
+inlawX = anchorNode.x + CARD_WIDTH + PARTNER_GAP
+exX    = anchorNode.x - CARD_WIDTH - PARTNER_GAP   // or stacked, see §4.3
+```
+
+This means the existing distribution algorithm requires **zero changes to its core logic**.
+
+### 4.3 Multiple Ex-Partners — Stacking Strategy
+
+When a blood node has more than one ex-partner, prevent overlap using one of two strategies. **Choose based on available horizontal space:**
+
+| Strategy | When to use | Layout |
+|---|---|---|
+| **Horizontal chain** | Fewer than 3 ex-partners | Ex-nodes placed in a horizontal row, each offset by `CARD_WIDTH + PARTNER_GAP` |
+| **Staggered offset** | 3 or more ex-partners | Alternate above/below the generation baseline by `±STAGGER_OFFSET` (e.g. ±20px) |
+
+The algorithm must detect overflow (satellite nodes extending beyond the SVG canvas boundary) and fall back to staggered offset automatically.
+
+### 4.4 Children of Divorced/Ex Couples
+
+Children of an ex-couple still appear in the normal child generation row. Their parent edge must fork to connect to **both** parents even if one is an ex-node:
+
+```
+child.parentIds = ["blood_node_id", "ex_node_id"]
+```
+
+The parent edge renderer must handle the case where one parent is an ex-node and draw the fork accordingly, using the ex-node's resolved position.
 
 ---
 
-### Step 6 — Collect results
+## 5. Visual Encoding
 
-**Owner:** harness (collector.py)
+### 5.1 Node Appearance
 
-**Task:**
-- Wait for ALL workers to complete (no partial reduce)
-- Accumulate all worker outputs into fact_pool
-- Update worker_state per fact_id
+| Node Type | Border Color | Background | Badge |
+|---|---|---|---|
+| Blood relative | `#60a5fa` (blue) | `#eff6ff` | — |
+| In-law | `#34d399` (green) | `#f0fdf4` | `IN-LAW` |
+| Ex-partner | `#f87171` (red) | `#fff5f5` | `EX` |
+| Deceased (any type) | `#94a3b8` (slate) | `#f1f5f9` | `✝` |
 
-**State updated:** fact_pool, worker_state, phase → REDUCE
+- Badge is a small pill label rendered at top-right of the node card
+- Deceased overrides the type color — apply slate to any node where `deathYear` is set
 
----
+### 5.2 Partner Edge Appearance
 
-## Phase 2 — Reduce
+| Relationship | Stroke Color | Stroke Style | Width |
+|---|---|---|---|
+| `married` | `#64748b` | Solid | 2px |
+| `partnered` | `#64748b` | Solid | 1.5px |
+| `divorced` | `#f87171` | Dashed `6,4` | 2px |
+| `separated` | `#f87171` | Dashed `3,3` | 1.5px |
+| `widowed` | `#94a3b8` | Dotted `2,3` | 1.5px |
 
-### Step 7 — Build reduce context
+- Partner edges are **horizontal lines** drawn at mid-height of the node card
+- They connect from the right edge of the left node to the left edge of the right node
+- A small relationship label (e.g. `"div. 2008"`) may optionally render as centered text above the partner edge, in a 10px muted font
 
-**Owner:** harness (reducer.py)
+### 5.3 Parent Edge from Ex-Node
 
-**Reduce context (XML-wrapped):**
-```xml
-<agent_behavior>   [agent.md content]               </agent_behavior>
-<knowledge>        [knowledge.md content]            </knowledge>
-<skill>            [skills/will/B1.md content]       </skill>
-<schema_definition>[schema fields for this doc type] </schema_definition>
-<fact_pool>        [all raw worker outputs]           </fact_pool>
-```
+When a parent edge forks from a divorced couple, render the branch going to the ex-node as a **dashed line** matching the partner edge style. The branch going to the blood node remains solid.
 
-**Note:** fact_pool is sent raw and uncompressed — no information loss.
+### 5.4 Legend
 
----
+Add a legend block to the SVG output, anchored to the **bottom-left** of the viewport:
 
-### Step 8 — Apply skills + derive fields
-
-**Owner:** main agent
-
-**Task:**
-- Read all facts from fact_pool
-- Apply skill inference per fact
-- Derive complex fields that require inference across multiple facts:
-  - `first_death` / `second_death` → from survivorship evidence
-  - `successor_chain` → from executor + successor_executor facts
-  - `contingent_entitlement` → from survivorship + beneficiary facts
-- Ground all inference in knowledge terms
-
-**Per-fact status handling:**
-| status | action |
-|--------|--------|
-| found + citation | apply skill, populate schema field |
-| absent + null | mark field null with reason |
-| uncertain + null | flag for correction loop |
-
-**Output:** schema with status + citation per field
+- Render it as a `<g>` group with a light background rect
+- It must not overlap any tree nodes — if it does, shift it to bottom-right
+- Contents: one row per node type (color swatch + label) and one row per edge type (line sample + label)
 
 ---
 
-### Step 9 — Self-correction loop
+## 6. Rendering Order (Z-Index / Paint Order)
 
-**Owner:** main agent + harness
+SVG has no z-index — paint order matters. Render in this sequence:
 
-**Trigger:** any field with status `uncertain` or `unverified`
-
-**Loop:**
-```
-while uncertain fields exist:
-  if all uncertain fields at max attempts:
-    mark all as requires_review
-    break
-
-  harness: re-route uncertain facts to broader article set
-  worker: re-run for uncertain facts only
-  
-  correction context:
-    previous schema + new worker results (problem facts only)
-    NOT full fact_pool — compressed, targeted
-
-  main agent: re-reduce problem fields
-  update schema
-```
-
-**Correction context (XML-wrapped):**
-```xml
-<agent_behavior>    [agent.md]                </agent_behavior>
-<knowledge>         [knowledge.md]            </knowledge>
-<skill>             [skill.md]                </skill>
-<previous_schema>   [schema built so far]     </previous_schema>
-<correction_facts>  [new results for uncertain facts only] </correction_facts>
-```
-
-**Correction limits:**
-```
-MAX_CORRECTION_ATTEMPTS = 2
-exceeded → status: requires_review → human review
-```
+1. Parent edges (vertical connector lines) — bottom layer
+2. Partner edges (horizontal connector lines)
+3. Blood nodes
+4. In-law nodes
+5. Ex-nodes
+6. Badges and labels — top layer
 
 ---
 
-## Validation
+## 7. Input Format — New Sample
 
-### Step 10 — Validate schema structure
-
-**Owner:** harness (validator.py)
-
-**Checks (structural only — no content validation):**
-- All fields have a status value
-- Status values are valid enum members
-- JSON structure is well-formed
-- Required fields are present
-
-**Not validated by harness:**
-- Content accuracy
-- Citation correctness
-- Logical consistency
-
-**Output:** SchemaOutput or validation error
-
----
-
-## Output
-
-Every field in the final schema carries:
+The following illustrates a minimal valid input containing all new node types:
 
 ```json
 {
-  "testator": {
-    "value":  "John Smith",
-    "status": "found",
-    "citation": {
-      "segment_id": "article_1",
-      "text": "I, John Smith, being of sound and disposing mind..."
+  "people": [
+    {
+      "id": "grandpa",
+      "name": "Robert Sr.",
+      "nodeType": "blood",
+      "birthYear": 1935,
+      "deathYear": 1998,
+      "parentIds": [],
+      "partners": [
+        { "partnerId": "grandma", "partnerRelationship": "married", "order": 1 }
+      ]
+    },
+    {
+      "id": "grandma",
+      "name": "Eleanor",
+      "nodeType": "blood",
+      "birthYear": 1938,
+      "parentIds": [],
+      "partners": [
+        { "partnerId": "grandpa", "partnerRelationship": "married", "order": 1 }
+      ]
+    },
+    {
+      "id": "dad",
+      "name": "Robert Jr.",
+      "nodeType": "blood",
+      "birthYear": 1960,
+      "parentIds": ["grandpa", "grandma"],
+      "partners": [
+        { "partnerId": "ex_wife", "partnerRelationship": "divorced", "order": 1 },
+        { "partnerId": "mom",     "partnerRelationship": "married",  "order": 2 }
+      ]
+    },
+    {
+      "id": "ex_wife",
+      "name": "Tiffany",
+      "nodeType": "ex",
+      "anchorId": "dad",
+      "birthYear": 1962,
+      "parentIds": []
+    },
+    {
+      "id": "mom",
+      "name": "Sandra",
+      "nodeType": "inlaw",
+      "anchorId": "dad",
+      "birthYear": 1963,
+      "parentIds": []
+    },
+    {
+      "id": "child1",
+      "name": "Oliver",
+      "nodeType": "blood",
+      "birthYear": 1990,
+      "parentIds": ["dad", "ex_wife"]
+    },
+    {
+      "id": "child2",
+      "name": "Mia",
+      "nodeType": "blood",
+      "birthYear": 1993,
+      "parentIds": ["dad", "mom"]
     }
-  },
-  "first_death": {
-    "value":  null,
-    "status": "absent",
-    "reason": "no survivorship clause present in assigned articles",
-    "citation": null
-  },
-  "no_contest_clause": {
-    "value":  null,
-    "status": "requires_review",
-    "reason": "max correction attempts reached",
-    "citation": null
-  }
+  ]
 }
 ```
 
 ---
 
-## State transitions
+## 8. Acceptance Criteria
 
-```
-INIT  →  MAP        on: context loaded
-MAP   →  REDUCE     on: all workers complete
-REDUCE → CORRECTION on: uncertain fields detected
-CORRECTION → REDUCE on: correction workers complete
-REDUCE → COMPLETE   on: all fields resolved or max attempts reached
-```
+The implementation is complete when all of the following pass:
 
----
-
-## Error reference
-
-| condition | detected by | action |
-|-----------|-------------|--------|
-| worker: uncertain | collector | flag in fact_pool |
-| worker: unverified citation | main agent | flag in schema |
-| max correction attempts | harness | status: requires_review |
-| schema structure invalid | validator | raise validation error |
-| intersection query A∩B | main agent | run A first, pipe into B |
-| article not found | opensearch client | log, skip segment |
+- [ ] An in-law node renders on the same generation row as its anchor, to the right, with a green border and `IN-LAW` badge
+- [ ] An ex-node renders on the same generation row as its anchor, with a red dashed partner edge and `EX` badge
+- [ ] A divorced partner edge renders as a red dashed line; a married edge renders as a solid grey line
+- [ ] Children of a divorced couple connect via a forked parent edge — solid branch to blood parent, dashed branch to ex-parent
+- [ ] A node with two ex-partners renders both without overlap (horizontal chain or staggered)
+- [ ] The subtree distribution algorithm produces identical output for a tree containing only blood nodes, with or without this feature enabled
+- [ ] The 1:1 aspect ratio is maintained for all test cases including trees with in-laws and ex-nodes
+- [ ] A legend is present in every SVG output
+- [ ] Deceased nodes render in slate regardless of their `nodeType`
+- [ ] No satellite node (in-law or ex) extends beyond the SVG canvas boundary
 
 ---
 
-## Article overlap strategy
+## 9. Out of Scope
 
-B1∩B2 and B1∩B2∩B3 overlaps are expected in WILL documents (bequests, residuary, trust provisions). Strategy:
+The following are explicitly **not** required in this change:
 
-```
-router assigns same article to multiple workers
-harness deduplicates before fetching
-article fetched ONCE → cached
-multiple workers read from cache
-different workers cite different passages from same article
-```
+- Step-parent / step-sibling relationships (separate ticket)
+- Adoption relationships
+- Same-generation sibling connectors
+- Interactive pan/zoom (SVG is static output)
+- Any changes to the subtree split heuristic or aspect ratio algorithm
 
 ---
 
-## Extensibility
+## 10. Suggested Implementation Order
 
-| change | files to update |
-|--------|----------------|
-| new schema field | skill.md + knowledge.md |
-| new intent subset | workers.yaml + plan.md |
-| new document type | plan_{type}.md + workers_{type}.yaml + skills/{type}/ |
-| framework behaviour | agent.md only |
+1. Extend the data model and input parser — add `nodeType`, `partners`, `anchorId`
+2. Update the node renderer to apply type-based styles and badges
+3. Update the edge renderer to handle partner edge types and forked parent edges
+4. Add satellite node positioning after blood node layout is resolved
+5. Add overflow detection and stagger fallback for multiple ex-partners
+6. Add the SVG legend block
+7. Run all existing tree test cases to verify no regression
